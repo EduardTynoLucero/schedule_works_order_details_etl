@@ -152,7 +152,8 @@ async function upsertRows(
       VALUES ${part.map(() => placeholdersRow).join(",")}
       ON DUPLICATE KEY UPDATE ${updateSql}
     `;
-    await conn.execute(sql, part.flat());
+    // [RAM] query (no prepared statement): el numero de filas cambia en cada lote
+    await conn.query(sql, part.flat());
   }
 }
 
@@ -167,14 +168,16 @@ async function insertRows(conn: any, table: string, columns: string[], rows: any
       INSERT INTO ${table} (${colsSql})
       VALUES ${part.map(() => placeholdersRow).join(",")}
     `;
-    await conn.execute(sql, part.flat());
+    // [RAM] query (no prepared statement): el numero de filas cambia en cada lote
+    await conn.query(sql, part.flat());
   }
 }
 
 async function deleteChildrenForWorks(conn: any, table: string, workExternalIds: number[]) {
   for (const part of chunk(workExternalIds, 500)) {
     const placeholders = part.map(() => "?").join(",");
-    await conn.execute(`DELETE FROM ${table} WHERE work_external_id IN (${placeholders})`, part);
+    // [RAM] query: el tamaño del IN (...) cambia en cada lote
+    await conn.query(`DELETE FROM ${table} WHERE work_external_id IN (${placeholders})`, part);
   }
 }
 
@@ -190,7 +193,8 @@ async function readIdMap(
 
   for (const part of chunk(externalIds, 500)) {
     const placeholders = part.map(() => "?").join(",");
-    const [rows] = await conn.execute(
+    // [RAM] query: el tamaño del IN (...) cambia en cada lote
+    const [rows] = await conn.query(
       `SELECT \`${idColumn}\`, \`${externalColumn}\` FROM ${table} WHERE \`${externalColumn}\` IN (${placeholders})`,
       part
     );
@@ -211,7 +215,8 @@ async function readManufacturerMap(conn: any, manufacturerExternalIds: number[])
 
   for (const part of chunk(manufacturerExternalIds, 500)) {
     const placeholders = part.map(() => "?").join(",");
-    const [rows] = await conn.execute(
+    // [RAM] query: el tamaño del IN (...) cambia en cada lote
+    const [rows] = await conn.query(
       `
         SELECT external_manufacturer_id, manufacturer_type, manufacturer_external_id
         FROM external_manufacturers

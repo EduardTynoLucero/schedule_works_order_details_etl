@@ -34,6 +34,10 @@ export const config = {
     password: must("DB_PASS"),
     database: must("DB_NAME"),
     port: Number(process.env.DB_PORT ?? "3306"),
+    // [RAM] limites del pool (ver src/db.ts)
+    poolLimit: Math.max(1, toNum(process.env.DB_POOL_LIMIT, 5)),
+    poolMaxIdle: Math.max(0, toNum(process.env.DB_POOL_MAX_IDLE, 2)),
+    maxPreparedStatements: Math.max(1, toNum(process.env.DB_MAX_PREPARED_STATEMENTS, 50)),
   },
   tz: process.env.TZ ?? "America/Guatemala",
   cronExpr: process.env.CRON_EXPR ?? "*/3 * * * *",
