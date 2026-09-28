@@ -13,6 +13,13 @@ function toBool(v: any, def = false) {
   return s === "1" || s === "true" || s === "yes" || s === "y";
 }
 
+// Acepta DB_PASS o DB_PASSWORD y permite contraseña vacía (MySQL local sin password).
+function dbPassword(): string {
+  const v = process.env.DB_PASS ?? process.env.DB_PASSWORD;
+  if (v === undefined) throw new Error("Missing env var: DB_PASS (o DB_PASSWORD)");
+  return v;
+}
+
 function toNum(v: any, def: number) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
@@ -31,7 +38,7 @@ export const config = {
   db: {
     host: must("DB_HOST"),
     user: must("DB_USER"),
-    password: must("DB_PASS"),
+    password: dbPassword(),
     database: must("DB_NAME"),
     port: Number(process.env.DB_PORT ?? "3306"),
     // [RAM] limites del pool (ver src/db.ts)
@@ -53,6 +60,11 @@ export const config = {
     limit: toNum(process.env.WORK_DETAILS_LIMIT, 0),
     startAfterWorkId: toNum(process.env.WORK_DETAILS_START_AFTER_WORK_ID, 0),
     onlyMissing: toBool(process.env.WORK_DETAILS_ONLY_MISSING, false),
+    // Con ONLY_MISSING=1, ademas vuelve a pedir el detalle de las ordenes cuyo status o finish_date
+    // en works (lo actualiza el ETL del listado) ya no coincide con el detalle guardado.
+    refreshChanged: toBool(process.env.WORK_DETAILS_REFRESH_CHANGED, true),
+    // No vuelve a pedir la misma orden si su detalle se guardo hace menos de estos minutos.
+    refreshMinAgeMinutes: Math.max(0, toNum(process.env.WORK_DETAILS_REFRESH_MIN_AGE_MINUTES, 15)),
     batchDelayMs: toNum(process.env.WORK_DETAILS_BATCH_DELAY_MS, 250),
   },
 };

@@ -67,6 +67,14 @@ function toMysqlDateTime(value: unknown) {
   return text.slice(0, 19).replace("T", " ");
 }
 
+// delivery_note_date (fecha de envio) llega como fecha "YYYY-MM-DD"; como DATETIME queda a las 00:00:00.
+function toMysqlDateTimeFromDateOnly(value: unknown) {
+  const text = cleanText(value);
+  if (!text) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return `${text} 00:00:00`;
+  return toMysqlDateTime(text);
+}
+
 function asArray<T>(value: T[] | null | undefined) {
   return Array.isArray(value) ? value : [];
 }
@@ -103,14 +111,56 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
+// El detalle guardado quedo desactualizado: el ETL del listado ya cambio status o finish_date en works.
+// Solo si el detalle se guardo hace mas de N minutos (?), para no pedir la misma orden en cada vuelta
+// si la API tarda en reflejar el cambio en uno de los dos endpoints.
+const DETAIL_CHANGED_SQL = `
+  (NOT (w.status <=> ewd.status) OR NOT (w.finish_date <=> ewd.finish_date))
+  AND (ewd.updated_at IS NULL OR ewd.updated_at < NOW() - INTERVAL ? MINUTE)
+`;
+
+function refreshMinAge() {
+  return Math.max(0, Math.trunc(config.workDetails.refreshMinAgeMinutes));
+}
+
+async function logPendingRefs() {
+  if (!config.workDetails.onlyMissing) return;
+
+  const [row] = await exec<Array<{ missing: number | string | null; changed: number | string | null }>>(
+    `
+      SELECT
+        SUM(ewd.external_work_detail_id IS NULL) AS missing,
+        SUM(ewd.external_work_detail_id IS NOT NULL AND ${DETAIL_CHANGED_SQL}) AS changed
+      FROM works w
+      LEFT JOIN external_work_details ewd ON ewd.work_external_id = w.external_id
+      WHERE w.external_id IS NOT NULL
+        AND w.external_id <> 0
+        AND w.is_deleted = 0
+    `,
+    [refreshMinAge()]
+  );
+
+  logger.info(
+    `Work details ETL: pendientes sin detalle=${Number(row?.missing ?? 0)}` +
+      (config.workDetails.refreshChanged
+        ? ` con estado/finish_date distinto a works=${Number(row?.changed ?? 0)}`
+        : "")
+  );
+}
+
 async function fetchNextWorkRefs(lastWorkId: number, limit: number) {
   const safeLimit = Math.max(1, Math.trunc(limit));
-  const onlyMissingJoin = config.workDetails.onlyMissing
+  const { onlyMissing, refreshChanged } = config.workDetails;
+  const onlyMissingJoin = onlyMissing
     ? "LEFT JOIN external_work_details ewd ON ewd.work_external_id = w.external_id"
     : "";
-  const onlyMissingWhere = config.workDetails.onlyMissing
-    ? "AND ewd.external_work_detail_id IS NULL"
-    : "";
+  // sin detalle; y con REFRESH_CHANGED tambien las que cambiaron de estado en works
+  const onlyMissingWhere = !onlyMissing
+    ? ""
+    : refreshChanged
+      ? `AND (ewd.external_work_detail_id IS NULL OR (${DETAIL_CHANGED_SQL}))`
+      : "AND ewd.external_work_detail_id IS NULL";
+  const params = onlyMissing && refreshChanged ? [lastWorkId, refreshMinAge()] : [lastWorkId];
 
   return exec<WorkRef[]>(
     `
@@ -125,7 +175,7 @@ async function fetchNextWorkRefs(lastWorkId: number, limit: number) {
       ORDER BY w.work_id ASC
       LIMIT ${safeLimit}
     `,
-    [lastWorkId]
+    params
   );
 }
 
@@ -315,7 +365,8 @@ async function persistDetails(results: DetailResult[]) {
         toMysqlDateTime(detail.created_at),
         toMysqlDate(detail.order_date),
         toMysqlDate(detail.accept_date),
-        toMysqlDateTime(detail.estimated_delivery),
+        // estimated_delivery: manda delivery_note_date (fecha de envio); si aun no hay, la estimada de la API
+        toMysqlDateTimeFromDateOnly(detail.delivery_note_date) ?? toMysqlDateTime(detail.estimated_delivery),
         toMysqlDateTime(detail.deadline),
         toMysqlDate(detail.finish_date),
         toMysqlDate(detail.delivery_note_date),
@@ -646,8 +697,12 @@ export async function workDetailsEtl() {
 
   logger.info(
     `Work details ETL: start mode=DETAILS_ONLY batchSize=${batchSize} concurrency=${concurrency} ` +
-      `limit=${hardLimit || "ALL"} startAfterWorkId=${lastWorkId} onlyMissing=${config.workDetails.onlyMissing}`
+      `limit=${hardLimit || "ALL"} startAfterWorkId=${lastWorkId} onlyMissing=${config.workDetails.onlyMissing} ` +
+      `refreshChanged=${config.workDetails.onlyMissing && config.workDetails.refreshChanged} ` +
+      `refreshMinAgeMinutes=${refreshMinAge()}`
   );
+
+  await logPendingRefs();
 
   while (!hardLimit || attempted < hardLimit) {
     const nextLimit = hardLimit ? Math.min(batchSize, hardLimit - attempted) : batchSize;
