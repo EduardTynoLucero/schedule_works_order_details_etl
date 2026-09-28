@@ -1,11 +1,11 @@
 import { config } from "./config.js";
 import { closePool } from "./db.js";
 import { logger } from "./etl/common/logger.js";
-import { inExecutionWindow } from "./etl/common/time.js";
-import { workDetailsEtl } from "./etl/workDetailsEtl.js";
+import { runWorkDetailsCycle } from "./etl/workDetailsSchedule.js";
 
 // [SPLIT] ETL 3/3: detalle / mantenimiento de ordenes de trabajo (antes ETL_MODE=DETAILS_ONLY).
 // Recorre la tabla works (que llena schedule_works_order_list_etl) y trae /works/{id}.
+// Pendientes + cambios de estado; y una vez al dia desde las 19:00 barrido de todas las ordenes (ver workDetailsSchedule.ts).
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -21,16 +21,8 @@ async function runOnce() {
   running = true;
 
   try {
-    if (!inExecutionWindow(config.tz)) {
-      logger.info("Fuera de ventana (7AM-10PM Guatemala).");
-      return;
-    }
-
-    logger.info(`ETL work details run. mode=${config.etl.mode}`);
-
-    await workDetailsEtl();
-
-    logger.info("ETL OK");
+    const ran = await runWorkDetailsCycle();
+    if (ran) logger.info("ETL OK");
   } catch (err: any) {
     logger.error("ETL ERROR", err?.stack ?? err?.message ?? err);
   } finally {

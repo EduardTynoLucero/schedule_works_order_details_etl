@@ -111,72 +111,132 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-// El detalle guardado quedo desactualizado: el ETL del listado ya cambio status o finish_date en works.
-// Solo si el detalle se guardo hace mas de N minutos (?), para no pedir la misma orden en cada vuelta
-// si la API tarda en reflejar el cambio en uno de los dos endpoints.
-const DETAIL_CHANGED_SQL = `
-  (NOT (w.status <=> ewd.status) OR NOT (w.finish_date <=> ewd.finish_date))
-  AND (ewd.updated_at IS NULL OR ewd.updated_at < NOW() - INTERVAL ? MINUTE)
-`;
-
+// Ordenes con detalle ya guardado que conviene volver a pedir:
+// - el ETL del listado cambio status o finish_date en works (el detalle quedo viejo)
+// - terminadas en los ultimos N dias y el detalle todavia no trae delivery_note_date (fecha de envio)
+// - creadas en los ultimos N dias sin ninguna fecha estimada (ni en works ni en el detalle)
+// Solo si el detalle se guardo hace mas de WORK_DETAILS_REFRESH_MIN_AGE_MINUTES, para no pedir la misma
+// orden en cada vuelta si la API tarda en reflejar el cambio.
 function refreshMinAge() {
   return Math.max(0, Math.trunc(config.workDetails.refreshMinAgeMinutes));
 }
 
-async function logPendingRefs() {
-  if (!config.workDetails.onlyMissing) return;
+function refreshMissingDatesDays() {
+  return Math.max(0, Math.trunc(config.workDetails.refreshMissingDatesDays));
+}
 
-  const [row] = await exec<Array<{ missing: number | string | null; changed: number | string | null }>>(
+function needsRefreshSql(): { sql: string; params: number[] } {
+  const days = refreshMissingDatesDays();
+  const reasons = ["NOT (w.status <=> ewd.status)", "NOT (w.finish_date <=> ewd.finish_date)"];
+  const params: number[] = [];
+
+  if (days > 0) {
+    reasons.push("(ewd.delivery_note_date IS NULL AND w.finish_date >= CURDATE() - INTERVAL ? DAY)");
+    params.push(days);
+    reasons.push(
+      "(w.estimated_delivery IS NULL AND ewd.estimated_delivery IS NULL AND w.created_at_api >= NOW() - INTERVAL ? DAY)"
+    );
+    params.push(days);
+  }
+
+  params.push(refreshMinAge());
+  return {
+    sql:
+      `(${reasons.join(" OR ")}) ` +
+      "AND (ewd.updated_at IS NULL OR ewd.updated_at < NOW() - INTERVAL ? MINUTE)",
+    params,
+  };
+}
+
+/**
+ * Que ordenes toma cada pasada:
+ * - all: todas (barrido o WORK_DETAILS_ONLY_MISSING=0)
+ * - missing: sin fila en external_work_details (ordenes nuevas)
+ * - stale: con detalle, pero hay que volver a pedirlo (ver needsRefreshSql)
+ */
+export type RefsFilter = "all" | "missing" | "stale";
+
+export async function logPendingRefs() {
+  const refresh = needsRefreshSql();
+  const [row] = await exec<Array<{ missing: number | string | null; stale: number | string | null }>>(
     `
       SELECT
         SUM(ewd.external_work_detail_id IS NULL) AS missing,
-        SUM(ewd.external_work_detail_id IS NOT NULL AND ${DETAIL_CHANGED_SQL}) AS changed
+        SUM(ewd.external_work_detail_id IS NOT NULL AND ${refresh.sql}) AS stale
       FROM works w
       LEFT JOIN external_work_details ewd ON ewd.work_external_id = w.external_id
       WHERE w.external_id IS NOT NULL
         AND w.external_id <> 0
         AND w.is_deleted = 0
     `,
-    [refreshMinAge()]
+    refresh.params
   );
 
   logger.info(
-    `Work details ETL: pendientes sin detalle=${Number(row?.missing ?? 0)}` +
-      (config.workDetails.refreshChanged
-        ? ` con estado/finish_date distinto a works=${Number(row?.changed ?? 0)}`
-        : "")
+    `Work details ETL: por actualizar (cambio de estado / fechas faltantes)=${Number(row?.stale ?? 0)} ` +
+      `sin detalle=${Number(row?.missing ?? 0)}`
   );
 }
 
-async function fetchNextWorkRefs(lastWorkId: number, limit: number) {
+async function fetchNextWorkRefs(lastWorkId: number, limit: number, filter: RefsFilter) {
   const safeLimit = Math.max(1, Math.trunc(limit));
-  const { onlyMissing, refreshChanged } = config.workDetails;
-  const onlyMissingJoin = onlyMissing
-    ? "LEFT JOIN external_work_details ewd ON ewd.work_external_id = w.external_id"
-    : "";
-  // sin detalle; y con REFRESH_CHANGED tambien las que cambiaron de estado en works
-  const onlyMissingWhere = !onlyMissing
-    ? ""
-    : refreshChanged
-      ? `AND (ewd.external_work_detail_id IS NULL OR (${DETAIL_CHANGED_SQL}))`
-      : "AND ewd.external_work_detail_id IS NULL";
-  const params = onlyMissing && refreshChanged ? [lastWorkId, refreshMinAge()] : [lastWorkId];
+  const join =
+    filter === "all" ? "" : "LEFT JOIN external_work_details ewd ON ewd.work_external_id = w.external_id";
+  let where = "";
+  let params: number[] = [lastWorkId];
+
+  if (filter === "missing") {
+    where = "AND ewd.external_work_detail_id IS NULL";
+  } else if (filter === "stale") {
+    const refresh = needsRefreshSql();
+    where = `AND ewd.external_work_detail_id IS NOT NULL AND ${refresh.sql}`;
+    params = [lastWorkId, ...refresh.params];
+  }
 
   return exec<WorkRef[]>(
     `
       SELECT w.work_id, w.external_id
       FROM works w
-      ${onlyMissingJoin}
+      ${join}
       WHERE w.work_id > ?
         AND w.external_id IS NOT NULL
         AND w.external_id <> 0
         AND w.is_deleted = 0
-        ${onlyMissingWhere}
+        ${where}
       ORDER BY w.work_id ASC
       LIMIT ${safeLimit}
     `,
     params
   );
+}
+
+/**
+ * Copia la fecha correcta a works.estimated_delivery para las ordenes recien guardadas:
+ * fecha de envio del detalle (delivery_note_date); si no hay, se conserva la de works (listado);
+ * si works tampoco tiene, la estimada del detalle. Solo toca las filas donde cambia.
+ */
+async function syncWorksEstimatedDelivery(workExternalIds: number[]) {
+  if (!config.workDetails.syncWorksEstimatedDelivery || !workExternalIds.length) return 0;
+
+  let changed = 0;
+  for (const part of chunk(workExternalIds, 500)) {
+    const result: any = await withTx(async (conn) => {
+      const [res] = await conn.query(
+        `
+          UPDATE works w
+          JOIN external_work_details d ON d.work_external_id = w.external_id
+          SET w.estimated_delivery = COALESCE(d.delivery_note_date, w.estimated_delivery, d.estimated_delivery),
+              w.updated_by = 'etl'
+          WHERE w.external_id IN (?)
+            AND NOT (w.estimated_delivery <=> COALESCE(d.delivery_note_date, w.estimated_delivery, d.estimated_delivery))
+        `,
+        [part]
+      );
+      return res;
+    });
+    changed += Number(result?.affectedRows ?? 0);
+  }
+  return changed;
 }
 
 async function upsertRows(
@@ -683,73 +743,152 @@ async function persistDetails(results: DetailResult[]) {
   });
 }
 
-export async function workDetailsEtl() {
-  const batchSize = Math.max(1, Math.trunc(config.workDetails.batchSize));
-  const concurrency = Math.max(1, Math.trunc(config.workDetails.concurrency));
-  const hardLimit = Math.max(0, Math.trunc(config.workDetails.limit));
-  const batchDelayMs = Math.max(0, Math.trunc(config.workDetails.batchDelayMs));
+export type WorkDetailsRunOptions = {
+  /** true = barrido: todas las ordenes de works (ignora WORK_DETAILS_ONLY_MISSING y WORK_DETAILS_LIMIT) */
+  full?: boolean;
+  /** que ordenes toma (default: missing si WORK_DETAILS_ONLY_MISSING=1, si no all) */
+  filter?: RefsFilter;
+  /** empezar despues de este work_id (para reanudar un barrido) */
+  startAfterWorkId?: number;
+  concurrency?: number;
+  /** se revisa antes de cada lote; si devuelve true se detiene (completed=false) */
+  shouldStop?: () => boolean;
+  /** despues de guardar cada lote, con el ultimo work_id procesado */
+  onBatchDone?: (lastWorkId: number) => void;
+  label?: string;
+};
 
-  let lastWorkId = Math.max(0, Math.trunc(config.workDetails.startAfterWorkId));
+export type WorkDetailsRunResult = {
+  /** true = recorrio hasta que ya no hubo mas ordenes */
+  completed: boolean;
+  lastWorkId: number;
+  attempted: number;
+  persisted: number;
+  failed: number;
+};
+
+export async function workDetailsEtl(opts: WorkDetailsRunOptions = {}): Promise<WorkDetailsRunResult> {
+  const full = opts.full ?? false;
+  const filter: RefsFilter = full
+    ? "all"
+    : opts.filter ?? (config.workDetails.onlyMissing ? "missing" : "all");
+  const batchSize = Math.max(1, Math.trunc(config.workDetails.batchSize));
+  const concurrency = Math.max(1, Math.trunc(opts.concurrency ?? config.workDetails.concurrency));
+  const hardLimit = full ? 0 : Math.max(0, Math.trunc(config.workDetails.limit));
+  const batchDelayMs = Math.max(0, Math.trunc(config.workDetails.batchDelayMs));
+  const tag = opts.label ? ` [${opts.label}]` : "";
+
+  let lastWorkId = Math.max(0, Math.trunc(opts.startAfterWorkId ?? config.workDetails.startAfterWorkId));
   let attempted = 0;
   let fetched = 0;
   let failed = 0;
   let persisted = 0;
+  let worksDateUpdated = 0;
 
-  logger.info(
-    `Work details ETL: start mode=DETAILS_ONLY batchSize=${batchSize} concurrency=${concurrency} ` +
-      `limit=${hardLimit || "ALL"} startAfterWorkId=${lastWorkId} onlyMissing=${config.workDetails.onlyMissing} ` +
-      `refreshChanged=${config.workDetails.onlyMissing && config.workDetails.refreshChanged} ` +
-      `refreshMinAgeMinutes=${refreshMinAge()}`
-  );
+  let completed = false;
+  const startedAt = Date.now();
+  let apiMs = 0;
+  let dbMs = 0;
 
-  await logPendingRefs();
+  // [VELOCIDAD] Mientras un lote se guarda en la BD, ya se esta pidiendo el siguiente a la API.
+  // El guardado corre en una promesa que no rechaza (devuelve el error) para no provocar un
+  // "unhandled rejection"; el error se relanza al esperarla.
+  let pendingSave: Promise<unknown> | null = null;
+  const waitPendingSave = async () => {
+    if (!pendingSave) return;
+    const err = await pendingSave;
+    pendingSave = null;
+    if (err) throw err;
+  };
 
-  while (!hardLimit || attempted < hardLimit) {
-    const nextLimit = hardLimit ? Math.min(batchSize, hardLimit - attempted) : batchSize;
-    const refs = await fetchNextWorkRefs(lastWorkId, nextLimit);
-    if (!refs.length) break;
-
-    lastWorkId = Math.max(...refs.map((ref) => Number(ref.work_id)));
-    attempted += refs.length;
-
-    logger.info(
-      `Work details ETL: lote work_id>${refs[0].work_id - 1} refs=${refs.length} lastWorkId=${lastWorkId}`
-    );
-
-    const details = await mapWithConcurrency(refs, concurrency, async (ref) => {
-      try {
-        const detail = await fetchWorkDetail(ref.external_id);
-        if (!detail?.id) {
-          logger.warn(`Work details ETL: detalle vacío external_id=${ref.external_id}`);
-          failed += 1;
-          return null;
-        }
-
-        fetched += 1;
-        return { ref, detail };
-      } catch (err: any) {
-        failed += 1;
-        logger.warn(
-          `Work details ETL: no pude cargar detalle external_id=${ref.external_id} ` +
-            `status=${err?.response?.status ?? err?.code ?? err?.message ?? "unknown"}`
-        );
-        return null;
-      }
-    });
-
-    const validDetails = details.filter((item): item is DetailResult => item !== null);
+  const saveBatch = async (validDetails: DetailResult[], batchLastWorkId: number) => {
+    const t0 = Date.now();
     await persistDetails(validDetails);
     persisted += validDetails.length;
+    worksDateUpdated += await syncWorksEstimatedDelivery(uniqueNumbers(validDetails.map(getWorkExternalId)));
+    dbMs += Date.now() - t0;
 
+    const minutes = Math.max((Date.now() - startedAt) / 60000, 1 / 60);
     logger.info(
-      `Work details ETL: progreso attempted=${attempted} fetched=${fetched} ` +
-        `persisted=${persisted} failed=${failed} lastWorkId=${lastWorkId}`
+      `Work details ETL${tag}: progreso attempted=${attempted} fetched=${fetched} ` +
+        `persisted=${persisted} failed=${failed} works_fecha_actualizada=${worksDateUpdated} ` +
+        `lastWorkId=${batchLastWorkId} ritmo=${Math.round(persisted / minutes)}/min ` +
+        `tiempo_api=${Math.round(apiMs / 1000)}s tiempo_bd=${Math.round(dbMs / 1000)}s`
     );
 
-    if (batchDelayMs) await sleep(batchDelayMs);
+    opts.onBatchDone?.(batchLastWorkId);
+  };
+
+  logger.info(
+    `Work details ETL${tag}: start ordenes=${filter} batchSize=${batchSize} concurrency=${concurrency} ` +
+      `limit=${hardLimit || "ALL"} startAfterWorkId=${lastWorkId}`
+  );
+
+  try {
+    while (!hardLimit || attempted < hardLimit) {
+      if (opts.shouldStop?.()) break;
+
+      const nextLimit = hardLimit ? Math.min(batchSize, hardLimit - attempted) : batchSize;
+      const refs = await fetchNextWorkRefs(lastWorkId, nextLimit, filter);
+      if (!refs.length) {
+        completed = true;
+        break;
+      }
+
+      lastWorkId = Math.max(...refs.map((ref) => Number(ref.work_id)));
+      attempted += refs.length;
+
+      logger.info(
+        `Work details ETL: lote work_id>${refs[0].work_id - 1} refs=${refs.length} lastWorkId=${lastWorkId}`
+      );
+
+      const apiStart = Date.now();
+      const details = await mapWithConcurrency(refs, concurrency, async (ref) => {
+        try {
+          const detail = await fetchWorkDetail(ref.external_id);
+          if (!detail?.id) {
+            logger.warn(`Work details ETL: detalle vacío external_id=${ref.external_id}`);
+            failed += 1;
+            return null;
+          }
+
+          fetched += 1;
+          return { ref, detail };
+        } catch (err: any) {
+          failed += 1;
+          logger.warn(
+            `Work details ETL: no pude cargar detalle external_id=${ref.external_id} ` +
+              `status=${err?.response?.status ?? err?.code ?? err?.message ?? "unknown"}`
+          );
+          return null;
+        }
+      });
+
+      apiMs += Date.now() - apiStart;
+
+      const validDetails = details.filter((item): item is DetailResult => item !== null);
+
+      // el lote anterior tiene que quedar guardado antes de empezar a guardar este
+      await waitPendingSave();
+      pendingSave = saveBatch(validDetails, lastWorkId).then(
+        () => null,
+        (err) => err ?? new Error("Error guardando lote de detalles")
+      );
+
+      if (batchDelayMs) await sleep(batchDelayMs);
+    }
+
+    await waitPendingSave();
+  } catch (err) {
+    // terminar de guardar el lote en curso antes de salir con el error
+    if (pendingSave) await pendingSave;
+    throw err;
   }
 
   logger.info(
-    `Work details ETL: done attempted=${attempted} fetched=${fetched} persisted=${persisted} failed=${failed}`
+    `Work details ETL${tag}: ${completed ? "done" : "detenido"} attempted=${attempted} fetched=${fetched} ` +
+      `persisted=${persisted} failed=${failed} works_fecha_actualizada=${worksDateUpdated} lastWorkId=${lastWorkId}`
   );
+
+  return { completed, lastWorkId, attempted, persisted, failed };
 }

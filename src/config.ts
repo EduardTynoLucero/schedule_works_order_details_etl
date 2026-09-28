@@ -25,6 +25,11 @@ function toNum(v: any, def: number) {
   return Number.isFinite(n) ? n : def;
 }
 
+function toHour(v: any, def: number) {
+  const n = Number(v);
+  return v !== undefined && v !== "" && Number.isInteger(n) && n >= 0 && n <= 23 ? n : def;
+}
+
 // [SPLIT] Este repo siempre corre en modo DETAILS_ONLY (detalle / mantenimiento de works),
 // por eso ya no necesita ETL_MODE.
 
@@ -65,6 +70,22 @@ export const config = {
     refreshChanged: toBool(process.env.WORK_DETAILS_REFRESH_CHANGED, true),
     // No vuelve a pedir la misma orden si su detalle se guardo hace menos de estos minutos.
     refreshMinAgeMinutes: Math.max(0, toNum(process.env.WORK_DETAILS_REFRESH_MIN_AGE_MINUTES, 15)),
+    // Tambien vuelve a pedir: terminadas en los ultimos N dias sin fecha de envio (delivery_note_date) y
+    // creadas en los ultimos N dias sin ninguna fecha estimada. 0 = no.
+    refreshMissingDatesDays: Math.max(0, toNum(process.env.WORK_DETAILS_REFRESH_MISSING_DATES_DAYS, 7)),
+    // Al guardar el detalle, copia la fecha de envio a works.estimated_delivery.
+    syncWorksEstimatedDelivery: toBool(process.env.WORK_DETAILS_SYNC_WORKS_ESTIMATED_DELIVERY, true),
     batchDelayMs: toNum(process.env.WORK_DETAILS_BATCH_DELAY_MS, 250),
+    // Barrido diario: una sola vez al dia, a partir de WORK_DETAILS_NIGHTLY_START_HOUR (hora de
+    // Guatemala, default 19), recorre TODAS las ordenes (como ONLY_MISSING=0) hasta terminar, sin
+    // hora de fin. El resto del tiempo corre lo normal (pendientes + cambios de estado).
+    nightly: {
+      enabled: toBool(process.env.WORK_DETAILS_NIGHTLY_FULL, true),
+      startHour: toHour(process.env.WORK_DETAILS_NIGHTLY_START_HOUR, 19),
+      concurrency: toNum(
+        process.env.WORK_DETAILS_NIGHTLY_CONCURRENCY,
+        toNum(process.env.WORK_DETAILS_CONCURRENCY, 2)
+      ),
+    },
   },
 };
